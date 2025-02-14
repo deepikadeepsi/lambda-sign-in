@@ -4,6 +4,7 @@ Description: "CI/CD Pipeline for AWS Lambda Function (lambda-sign-in) using Code
 Parameters:
   GitHubRepo:
     Type: String
+    Default: "deepsi/lambda-sign-in"
     Description: "GitHub Repository (owner/repo)"
   GitHubBranch:
     Type: String
