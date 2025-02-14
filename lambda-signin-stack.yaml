@@ -1,0 +1,211 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "CI/CD Pipeline for AWS Lambda Function (lambda-sign-in) using CodePipeline, CodeBuild, and CloudFormation"
+
+Parameters:
+  GitHubRepo:
+    Type: String
+    Description: "GitHub Repository (owner/repo)"
+  GitHubBranch:
+    Type: String
+    Default: "main"
+    Description: "Branch to trigger CI/CD"
+  GitHubOAuthToken:
+    NoEcho: true
+    Type: String
+    Description: "GitHub OAuth Token for accessing repository"
+  LambdaFunctionName:
+    Type: String
+    Default: "lambda-sign-in"
+    Description: "Lambda function name"
+
+Resources:
+  ## S3 Bucket for Lambda Artifacts
+  LambdaArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "lambda-signin-artifacts-${AWS::AccountId}"
+
+  ## IAM Role for Lambda Execution
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: lambda-sign-in-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaBasicExecution
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  ## Lambda Function
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaArtifactBucket
+        S3Key: "lambda-sign-in.zip"
+      Timeout: 10
+      MemorySize: 256
+
+  ## API Gateway
+  APIGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: lambda-sign-in-api
+      Description: "API Gateway for Lambda Sign-In"
+
+  ## IAM Role for CodeBuild
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CodeBuildLambdaRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${LambdaArtifactBucket}/*"
+              - Effect: Allow
+                Action:
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                Resource: !GetAtt LambdaFunction.Arn
+
+  ## CodeBuild Project
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: lambda-sign-in-build
+      Source:
+        Type: GITHUB
+        Location: !Sub "https://github.com/${GitHubRepo}.git"
+        GitCloneDepth: 1
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - npm install
+            build:
+              commands:
+                - zip -r lambda-sign-in.zip .
+                - aws s3 cp lambda-sign-in.zip s3://${LambdaArtifactBucket}/lambda-sign-in.zip
+          artifacts:
+            files:
+              - lambda-sign-in.zip
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:5.0
+        Type: LINUX_CONTAINER
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+
+  ## IAM Role for CodePipeline
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CodePipelineLambdaRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodePipelinePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub "arn:aws:s3:::${LambdaArtifactBucket}/*"
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource: !GetAtt CodeBuildProject.Arn
+
+  ## CodePipeline
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: lambda-sign-in-pipeline
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref LambdaArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GitHubSource
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Provider: GitHub
+                Version: "1"
+              OutputArtifacts:
+                - Name: SourceArtifact
+              Configuration:
+                Owner: !Select [0, !Split ["/", !Ref GitHubRepo]]
+                Repo: !Select [1, !Split ["/", !Ref GitHubRepo]]
+                Branch: !Ref GitHubBranch
+                OAuthToken: !Ref GitHubOAuthToken
+        - Name: Build
+          Actions:
+            - Name: CodeBuild
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: BuildArtifact
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+        - Name: Deploy
+          Actions:
+            - Name: DeployLambda
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: "1"
+              InputArtifacts:
+                - Name: BuildArtifact
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                StackName: !Ref AWS::StackName
+                Capabilities: CAPABILITY_IAM
+                TemplatePath: BuildArtifact::lambda-signin-stack.yaml
+
