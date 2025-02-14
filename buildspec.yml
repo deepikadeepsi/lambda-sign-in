@@ -1,0 +1,18 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 18
+    commands:
+      - npm install
+
+  build:
+    commands:
+      - zip -r lambda-sign-in.zip .
+      - aws s3 cp lambda-sign-in.zip s3://$ARTIFACT_BUCKET/lambda-sign-in.zip
+
+artifacts:
+  files:
+    - lambda-sign-in.zip
+
